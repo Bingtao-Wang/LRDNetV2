@@ -1,0 +1,25 @@
+# 忽略数据集文件夹
+data/
+AUG/
+.venv_tf2/
+images/
+
+# 忽略训练生成的日志和权重文件
+results/
+
+# 忽略 PyCharm 的配置文件夹
+.idea/
+.pth/
+.log/
+
+# 忽略 Python 编译产生的缓存文件
+__pycache__/
+*.pyc
+
+# 忽略系统生成的文件
+.DS_Store
+Thumbs.db
+
+# 忽略可能存在的虚拟环境（虽然你的在外部，但以防万一）
+venv/
+env/

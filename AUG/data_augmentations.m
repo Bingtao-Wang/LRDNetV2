@@ -1,4 +1,4 @@
-
+clear all; clc
 
 
 % Transformations for augentation 

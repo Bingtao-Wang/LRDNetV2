@@ -96,11 +96,11 @@ class DataSet_aug():
                     resized_img = original_img.resize((self.width, self.height))
                     
                     ###################### Hist Eq Start##############
-                     R, G, B = cv.split(np.array(resized_img))
-                     output1_R = cv.equalizeHist(R)
-                     output1_G = cv.equalizeHist(G)
-                     output1_B = cv.equalizeHist(B)
-                     resized_img = cv.merge((output1_R, output1_G, output1_B))                    
+                    R, G, B = cv.split(np.array(resized_img))
+                    output1_R = cv.equalizeHist(R)
+                    output1_G = cv.equalizeHist(G)
+                    output1_B = cv.equalizeHist(B)
+                    resized_img = cv.merge((output1_R, output1_G, output1_B))
                     ###################### Hist Eq  END ##############
                     
                     image0 = img_to_array(resized_img)/255.

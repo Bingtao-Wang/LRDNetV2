@@ -1,22 +1,23 @@
+import os
 import sys
-from keras.layers import Multiply, AveragePooling2D, ReLU, Lambda, Activation, multiply, Average, add, Dense, Conv2D, \
-    Input, concatenate, MaxPool2D, UpSampling2D, Concatenate, Conv2DTranspose, MaxPooling2D, Dropout
-from keras import layers
-from keras.optimizers import Adam, Adadelta
-from keras.models import Model
-from keras.models import load_model
-from keras.utils import get_file
-from keras.models import model_from_json
-from keras.models import Sequential
-from keras.models import model_from_json
-import keras
-import keras.backend as K
-from keras.models import Sequential
 
+# 【重要】配置 segmentation_models 使用 tensorflow.keras
+os.environ["SM_FRAMEWORK"] = "tf.keras"
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import backend as K
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import (
+    Input, Conv2D, Conv2DTranspose, MaxPooling2D, AveragePooling2D,
+    UpSampling2D, Concatenate, Multiply, Add, Activation, Lambda,
+    Dropout, Dense, GlobalAveragePooling2D, add, multiply
+)
+from tensorflow.keras.optimizers import Adam
+
+# 确保已安装 segmentation-models
 import segmentation_models as sm
 from segmentation_models.utils import set_trainable
-import tensorflow as tf
-import os.path
 
 
 class ResearchModels():
@@ -25,46 +26,38 @@ class ResearchModels():
         self.width = width
         self.height = height
         self.dim = dim
+        self.model = None
 
         if 'LRDNet' in modelname:
-            print("***** Loading LRDNet proposed model*****")
+            print("***** Loading LRDNet proposed model *****")
             self.model = self.LRDNet()
+        else:
+            print(f"Warning: Model name '{modelname}' does not contain 'LRDNet'.")
 
-        if verb == 1:
+        if verb == 1 and self.model is not None:
             self.model.summary()
-            print('*******Total parameters********', self.model.count_params())
+            print('******* Total parameters ********', self.model.count_params())
 
-    def DiceLoss(self, y_true, y_pred):
-        smooth = 1e-6
-        gama = 2
-        y_true, y_pred = tf.cast(
-            y_true, dtype=tf.float32), tf.cast(y_pred, tf.float32)
-        nominator = 2 * \
-                    tf.reduce_sum(tf.multiply(y_pred, y_true)) + smooth
-        denominator = tf.reduce_sum(
-            y_pred ** gama) + tf.reduce_sum(y_true ** gama) + smooth
-        result = 1 - tf.divide(nominator, denominator)
-        return result
-
-    def get_kwargs(self):
-        return {
-            'backend': keras.backend,
-            'layers': keras.layers,
-            'models': keras.models,
-            'utils': keras.utils,
-        }
-
+    # ================= Metrics & Loss (修复 NaN 关键部分) =================
     def dice_coef(self, y_true, y_pred):
+        # 【关键修改】强制转换为 float32，防止混合精度下的数值下溢
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+
         smooth = 1e-5
+        y_true_f = K.flatten(y_true)
+        y_pred_f = K.flatten(y_pred)
+        intersection = K.sum(y_true_f * y_pred_f)
+        return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
 
-        y_true = tf.round(tf.reshape(y_true, [-1]))
-        y_pred = tf.round(tf.reshape(y_pred, [-1]))
-
-        isct = tf.reduce_sum(y_true * y_pred)
-
-        return 2 * isct / (tf.reduce_sum(y_true) + tf.reduce_sum(y_pred))
+    def dice_coef_loss(self, y_true, y_pred):
+        return 1.0 - self.dice_coef(y_true, y_pred)
 
     def iou_coef(self, y_true, y_pred):
+        # 【关键修改】强制转换为 float32
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+
         smooth = 1e-5
         intersection = K.sum(K.abs(y_true * y_pred), axis=[1, 2, 3])
         union = K.sum(y_true, [1, 2, 3]) + K.sum(y_pred, [1, 2, 3]) - intersection
@@ -74,369 +67,198 @@ class ResearchModels():
     def iou_loss(self, y_true, y_pred):
         return 1.0 - self.iou_coef(y_true, y_pred)
 
-    def dice_coef_loss(self, y_true, y_pred):
-        return 1 - self.dice_coef(y_true, y_pred)
-
-    def down(self, input_layer, filters, pool=True):
-        filters = int(filters)
-        conv1 = Conv2D(filters, (3, 3), padding='same', activation='relu')(input_layer)
-        residual = Conv2D(filters, (3, 3), padding='same', activation='relu')(conv1)
-        if pool:
-            max_pool = MaxPool2D()(residual)
-            # max_pool=GlobalWeightedAveragePooling2D()(residual)
-            return max_pool, residual
-        else:
-            return residual
-
-    def up(self, input_layer, residual, filters):
-        filters = int(filters)
-        upsample = UpSampling2D(interpolation='bilinear')(input_layer)
-        upconv = Conv2D(filters, kernel_size=(2, 2), padding="same")(upsample)
-        concat = Concatenate(axis=3)([residual, upconv])
-        conv1 = Conv2D(filters, (3, 3), padding='same', activation='relu')(concat)
-        conv2 = Conv2D(filters, (3, 3), padding='same', activation='relu')(conv1)
-        return conv2
-
-    def TransNet(self, img, ADI, filters=1):
-        assert img.shape != ADI.shape, ("Input shape mismatched: Shapes must be same ", img.shape, ADI.shape)
-        f = int(ADI.shape[3])
+    # ================= Helper Blocks =================
+    def TransNet(self, img, ADI):
+        # 简单的特征融合模块
+        f = int(ADI.shape[-1])
         theta_a = Conv2D(f, [1, 1], strides=[1, 1], padding='same')(ADI)
         theta_b = Conv2D(f, [1, 1], strides=[1, 1], padding='same')(ADI)
+
         x1 = Multiply()([theta_a, ADI])
-        x1 = add([x1, theta_b])
+        x1 = Add()([x1, theta_b])
         x2 = Concatenate(axis=3)([x1, img])
         return x2
 
     def fuse(self, a, b, c, d):
-        f = int(a.shape[3])
-        t_a = Conv2D(f, [3, 3], strides=[1, 1], padding='same')(a)
-        t_b = Conv2D(f, [3, 3], strides=[1, 1], padding='same')(b)
-        t_c = Conv2D(f, [3, 3], strides=[1, 1], padding='same')(c)
-        t_d = Conv2D(f, [3, 3], strides=[1, 1], padding='same')(d)
+        # 多尺度融合
+        f = int(a.shape[-1])
+        t_a = Conv2D(f, [3, 3], padding='same')(a)
+        t_b = Conv2D(f, [3, 3], padding='same')(b)
+        t_c = Conv2D(f, [3, 3], padding='same')(c)
+        t_d = Conv2D(f, [3, 3], padding='same')(d)
 
-        x1 = add([t_a, t_b])
-        x1 = add([x1, t_c])
-        x1 = add([x1, t_d])
-        return x1
+        x = Add()([t_a, t_b])
+        x = Add()([x, t_c])
+        x = Add()([x, t_d])
+        return x
 
-    def get_backbone(self, backbone):
+    def get_backbone(self, backbone_name):
+        print(f'**** Initializing backbone: {backbone_name} ****')
+        # 使用 segmentation_models 加载预训练权重
+        backbone = sm.Unet(backbone_name, encoder_weights='imagenet')
 
-        # one of : inceptionv3,mobilenetv2,mobilenet,ResNet34, ResNet50, ResNet101,ResNet152, resnext50, resnext101, vgg16 , vgg19,inceptionresnetv2
-        # backbone='EfficientNetB6'
-
-        ##########################################################
-        if backbone == 'EfficientNetB6':
-            print('**** EfficientNetB6 backbone ****')
-            backbone = sm.Unet('efficientnetb6', encoder_weights='imagenet')
-            layer_names = ['block6a_expand_activation', 'block4a_expand_activation', 'block3a_expand_activation',
-                           'block2a_expand_activation']
-        elif backbone == 'EfficientNetB5':
-            print('**** EfficientNetB5 backbone ****')
-            backbone = sm.Unet('efficientnetb5', encoder_weights='imagenet')
-            layer_names = ['block6a_expand_activation', 'block4a_expand_activation', 'block3a_expand_activation',
-                           'block2a_expand_activation']
-        elif backbone == 'EfficientNetB7':
-            print('**** EfficientNetB7 backbone ****')
-            backbone = sm.Unet('efficientnetb7', encoder_weights='imagenet')
-            layer_names = ['block6a_expand_activation', 'block4a_expand_activation', 'block3a_expand_activation',
-                           'block2a_expand_activation']
-        elif backbone == 'ResNet34':
-            # backbone=load_model('./models/weights/resnet34.hdf5')
-            backbone = sm.Unet('resnet34', encoder_weights='imagenet')
-            layer_names = ['stage4_unit1_relu1', 'stage3_unit1_relu1', 'stage2_unit1_relu1', 'relu0']
-        elif backbone == 'ResNet50':
-            backbone = sm.Unet('resnet50', encoder_weights='imagenet')
-            layer_names = ['stage4_unit1_relu1', 'stage3_unit1_relu1', 'stage2_unit1_relu1', 'relu0']
-        elif backbone == 'ResNet101':
-            backbone = sm.Unet('resnet101', encoder_weights='imagenet')
-            layer_names = ['stage4_unit1_relu1', 'stage3_unit1_relu1', 'stage2_unit1_relu1', 'relu0']
-        elif backbone == 'ResNet152':
-            backbone = sm.Unet('resnet152', encoder_weights='imagenet')
-            layer_names = ['stage4_unit1_relu1', 'stage3_unit1_relu1', 'stage2_unit1_relu1', 'relu0']
-        elif backbone == 'resnext50':
-            print('**** resnext50 backbone ****')
-            backbone = sm.Unet('resnext50', encoder_weights='imagenet')
-            layer_names = ['stage4_unit1_relu1', 'stage3_unit1_relu1', 'stage2_unit1_relu1', 'relu0']
-        elif backbone == 'resnext101':
-            print('**** resnext101 backbone ****')
-            backbone = sm.Unet('resnext101', encoder_weights='imagenet')
-            layer_names = ['stage4_unit1_relu1', 'stage3_unit1_relu1', 'stage2_unit1_relu1', 'relu0']
-        elif backbone == 'vgg16':
-            backbone = sm.Unet('vgg16', encoder_weights='imagenet')
+        # 定义需要提取特征的层名称 (针对 VGG19)
+        if backbone_name == 'vgg19':
             layer_names = ['block5_conv3', 'block4_conv3', 'block3_conv3', 'block2_conv2', 'block1_conv2']
-        elif backbone == 'vgg19':
-            print('**** VGG 19 backbone ****')
-            backbone = sm.Unet('vgg19', encoder_weights='imagenet')
+        else:
             layer_names = ['block5_conv3', 'block4_conv3', 'block3_conv3', 'block2_conv2', 'block1_conv2']
-        elif backbone == 'mobilenet':
-            print('**** mobilenet backbone ****')
-            backbone = sm.Unet('mobilenet', encoder_weights='imagenet')
-            layer_names = ['conv_pw_11_relu', 'conv_pw_5_relu', 'conv_pw_3_relu', 'conv_pw_1_relu']
-        elif backbone == 'mobilenetv2':
-            print('**** mobilenetv2 backbone ****')
-            backbone = sm.Unet('mobilenetv2', encoder_weights='imagenet')
-            layer_names = ['block_13_expand_relu', 'block_6_expand_relu', 'block_3_expand_relu', 'block_1_expand_relu']
-        elif backbone == 'seresnet18':
-            print('**** seresnet18 backbone ****')
-            backbone = sm.Unet('seresnet18', encoder_weights='imagenet')
-            layer_names = ['stage4_unit1_relu1', 'stage3_unit1_relu1', 'stage2_unit1_relu1', 'relu0']
-        elif backbone == 'seresnet34':
-            print('**** seresnet34 backbone ****')
-            backbone = sm.Unet('seresnet34', encoder_weights='imagenet')
-            layer_names = ['stage4_unit1_relu1', 'stage3_unit1_relu1', 'stage2_unit1_relu1', 'relu0']
-        elif backbone == 'inceptionresnetv2':
-            print('**** Inceptionresnetv2 backbone ****')
-            layer_num = [594, 260, 16, 9]
-            backbone = sm.Unet('inceptionresnetv2', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
-        elif backbone == 'inceptionv3':
-            print('**** inceptionv3 backbone ****')
-            layer_num = [228, 86, 16, 9]
-            backbone = sm.Unet('inceptionv3', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
-        elif backbone == 'seresnet50':
-            print('**** seresnet50 backbone ****')
-            layer_num = [246, 136, 62, 4]
-            backbone = sm.Unet('seresnet50', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
-        elif backbone == 'seresnet101':
-            print('**** seresnet101 backbone ****')
-            layer_num = [552, 136, 62, 4]
-            backbone = sm.Unet('seresnet101', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
-        elif backbone == 'seresnet152':
-            print('**** seresnet152 backbone ****')
-            layer_num = [858, 208, 62, 4]
-            backbone = sm.Unet('seresnet152', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
 
-        elif backbone == 'seresnext50':
-            print('**** seresnext50 backbone ****')
-            layer_num = [1078, 584, 254, 4]
-            backbone = sm.Unet('seresnext50', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
-        elif backbone == 'seresnext50':
-            print('**** seresnext50 backbone ****')
-            layer_num = [1078, 584, 254, 4]
-            backbone = sm.Unet('seresnext50', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
-        elif backbone == 'seresnext101':
-            print('**** seresnext101 backbone ****')
-            layer_num = [2472, 584, 254, 4]
-            backbone = sm.Unet('seresnext101', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
-        elif backbone == 'senet154':
-            print('**** senet154 backbone ****')
-            layer_num = [6884, 1625, 454, 12]
-            backbone = sm.Unet('senet154', encoder_weights='imagenet')
-            layer_names = []
-            # convert layer index to layer names
-            for idx, layer in enumerate(backbone.layers):
-                if idx in layer_num:
-                    layer_names.append(layer.name)
-            layer_names = layer_names[::-1]
         return backbone, layer_names
 
-    def LRDNet(self):  # reduced filter sizes to optimize performance
-        # Changed last layer to relu
-        print('********** LRDNet **********')
+    # ================= Main Model Architecture =================
+    def LRDNet(self):
         height = self.height
         width = self.width
+
+        # 1. 获取主干网络
         backbone, layer_names = self.get_backbone('vgg19')
 
-        ### make the pre-trained layer trainable
-        backbone.compile('Adam', 'binary_crossentropy', ['binary_accuracy'])
-        set_trainable(backbone)
+        # 2. 冻结或微调设置 (此处设为可训练)
+        backbone.trainable = True
 
-        input_layer = Input(shape=[height, width, 3])
-        input_layer_2 = Input(shape=[height, width, 3])
+        # 3. 定义输入
+        input_layer = Input(shape=(height, width, 3), name='input_img')
+        input_layer_2 = Input(shape=(height, width, 3), name='input_adi')
 
-        # Flavours, try out all of them
-        if 'V1' in self.modelname:  # <<< -- LRDNet S/L
-            l1_flt = 8
-            col_2_F = 64
-            col_3_F = 32
-            col_4_F = 16
-            last_filters = 256
-
-        if 'V2' in self.modelname:  ## << works well (visual inspection), but couldnt test on evaluation server, try it yourself.
-            l1_flt = 16
-            col_2_F = 16
-            col_3_F = 8
-            col_4_F = 4
-            last_filters = 64
-
-        if 'V3' in self.modelname:  # <<< --  LRDNet +
-            l1_flt = 64
-            col_2_F = 64
-            col_3_F = 32
-            col_4_F = 16
-            last_filters = 256
-        # ==================== INSERT START ====================
-        # 修复补丁：如果上面的 V1/V2/V3 都没有命中，则使用默认参数 (V3配置)
-        if 'l1_flt' not in locals():
-            print("Running in Default Mode (V3 Config) for:", self.modelname)
-            l1_flt = 64
-            col_2_F = 64
-            col_3_F = 32
-            col_4_F = 16
-            last_filters = 256
-        # ==================== INSERT END ====================
-
+        # 4. 配置滤波器参数 (默认为 V3 配置)
+        l1_flt = 64
+        col_2_F = 64
+        col_3_F = 32
+        col_4_F = 16
+        last_filters = 256
         activation = 'relu'
 
-        ########## ADI Branch
-        im = Model(inputs=backbone.input, outputs=backbone.get_layer(layer_names[3]).output)
-        x = im(input_layer_2)
+        # 辅助函数：从 backbone 提取特定层输出
+        def get_feat(inp, layer_name):
+            return Model(inputs=backbone.input, outputs=backbone.get_layer(layer_name).output)(inp)
 
-        col_1_1_A = Conv2D(l1_flt, (3, 3), padding='same', activation=activation)(x)
+        # ---------------- ADI Branch (辅助输入分支) ----------------
+        # 提取不同尺度的特征
+        x_adi_0 = get_feat(input_layer_2, layer_names[0])  # block5
+        x_adi_1 = get_feat(input_layer_2, layer_names[1])  # block4
+        x_adi_2 = get_feat(input_layer_2, layer_names[2])  # block3
+        x_adi_3 = get_feat(input_layer_2, layer_names[3])  # block2
 
-        im = Model(inputs=backbone.input, outputs=backbone.get_layer(layer_names[2]).output)
-        x = im(input_layer_2)
-        col_1_2_A = Conv2D(l1_flt * 2, (3, 3), padding='same', activation=activation)(x)
+        # 对应原代码 col_1_x_A
+        feat_A_1 = Conv2D(l1_flt, (3, 3), padding='same', activation=activation)(x_adi_3)
+        feat_A_2 = Conv2D(l1_flt * 2, (3, 3), padding='same', activation=activation)(x_adi_2)
+        feat_A_3 = Conv2D(l1_flt * 4, (3, 3), padding='same', activation=activation)(x_adi_1)
+        feat_A_4 = Conv2D(l1_flt * 8, (3, 3), padding='same', activation=activation)(x_adi_0)
 
-        im = Model(inputs=backbone.input, outputs=backbone.get_layer(layer_names[1]).output)
-        x = im(input_layer_2)
-        col_1_3_A = Conv2D(l1_flt * 4, (3, 3), padding='same', activation=activation)(x)
+        # 对应原代码 col_2_x_A
+        feat_A_2_1 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(feat_A_1)
+        feat_A_2_2 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(feat_A_2)
+        feat_A_2_3 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(feat_A_3)
+        feat_A_2_4 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(feat_A_4)
 
-        im = Model(inputs=backbone.input, outputs=backbone.get_layer(layer_names[0]).output)
-        x = im(input_layer_2)
-        col_1_4_A = Conv2D(l1_flt * 8, (3, 3), padding='same', activation=activation)(x)
+        # 对应原代码 col_3_x_A
+        feat_A_3_1 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(feat_A_2_1)
+        feat_A_3_2 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(feat_A_2_2)
+        feat_A_3_3 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(feat_A_2_3)
+        feat_A_3_4 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(feat_A_2_4)
 
-        col_2_4_A = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(col_1_4_A)
-        col_2_3_A = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(col_1_3_A)
-        col_2_2_A = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(col_1_2_A)
-        col_2_1_A = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(col_1_1_A)
+        # 对应原代码 col_4_x_A
+        feat_A_4_1 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(feat_A_3_1)
+        feat_A_4_2 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(feat_A_3_2)
+        feat_A_4_3 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(feat_A_3_3)
+        feat_A_4_4 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(feat_A_3_4)
 
-        col_3_1_A = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(col_2_1_A)
-        col_3_2_A = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(col_2_2_A)
-        col_3_3_A = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(col_2_3_A)
-        col_3_4_A = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(col_2_4_A)
+        # 上采样对齐
+        up_A_1 = UpSampling2D(size=(2, 2), interpolation='bilinear')(feat_A_4_1)
+        up_A_2 = UpSampling2D(size=(4, 4), interpolation='bilinear')(feat_A_4_2)
+        up_A_3 = UpSampling2D(size=(8, 8), interpolation='bilinear')(feat_A_4_3)
+        up_A_4 = UpSampling2D(size=(16, 16), interpolation='bilinear')(feat_A_4_4)
 
-        col_4_1_A = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(col_3_1_A)
-        col_4_2_A = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(col_3_2_A)
-        col_4_3_A = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(col_3_3_A)
-        col_4_4_A = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(col_3_4_A)
+        # 融合 ADI 特征
+        cat_A = self.fuse(up_A_1, up_A_2, up_A_3, up_A_4)
 
-        upsample_1_A = UpSampling2D(interpolation='bilinear', size=(2, 2))(col_4_1_A)
-        upsample_2_A = UpSampling2D(interpolation='bilinear', size=(4, 4))(col_4_2_A)
-        upsample_3_A = UpSampling2D(interpolation='bilinear', size=(8, 8))(col_4_3_A)
-        upsample_4_A = UpSampling2D(interpolation='bilinear', size=(16, 16))(col_4_4_A)
+        # ---------------- Image Branch (主图像分支) ----------------
+        x_img_0 = get_feat(input_layer, layer_names[0])
+        x_img_1 = get_feat(input_layer, layer_names[1])
+        x_img_2 = get_feat(input_layer, layer_names[2])
+        x_img_3 = get_feat(input_layer, layer_names[3])
 
-        # out_A = Conv2D(filters=last_filters, kernel_size=(3, 3), padding='same',activation="sigmoid")(cat_A)
+        # Stage 1: Initial Conv + TransNet Fusion
+        feat_1_1 = Conv2D(l1_flt, (3, 3), padding='same', activation=activation)(x_img_3)
+        feat_1_1 = self.TransNet(feat_1_1, feat_A_1)
 
-        #### Image branch
-        im = Model(inputs=backbone.input, outputs=backbone.get_layer(layer_names[3]).output)
-        x = im(input_layer)
-        col_1_1 = Conv2D(l1_flt, (3, 3), padding='same', activation=activation)(x)
-        col_1_1 = self.TransNet(col_1_1, col_1_1_A)
+        feat_1_2 = Conv2D(l1_flt * 2, (3, 3), padding='same', activation=activation)(x_img_2)
+        feat_1_2 = self.TransNet(feat_1_2, feat_A_2)
 
-        im = Model(inputs=backbone.input, outputs=backbone.get_layer(layer_names[2]).output)
-        x = im(input_layer)
-        col_1_2 = Conv2D(l1_flt * 2, (3, 3), padding='same', activation=activation)(x)
-        col_1_2 = self.TransNet(col_1_2, col_1_2_A)
+        feat_1_3 = Conv2D(l1_flt * 4, (3, 3), padding='same', activation=activation)(x_img_1)
+        feat_1_3 = self.TransNet(feat_1_3, feat_A_3)
 
-        im = Model(inputs=backbone.input, outputs=backbone.get_layer(layer_names[1]).output)
-        x = im(input_layer)
-        col_1_3 = Conv2D(l1_flt * 4, (3, 3), padding='same', activation=activation)(x)
-        col_1_3 = self.TransNet(col_1_3, col_1_3_A)
+        feat_1_4 = Conv2D(l1_flt * 8, (3, 3), padding='same', activation=activation)(x_img_0)
+        feat_1_4 = self.TransNet(feat_1_4, feat_A_4)
 
-        im = Model(inputs=backbone.input, outputs=backbone.get_layer(layer_names[0]).output)
-        x = im(input_layer)
-        col_1_4 = Conv2D(l1_flt * 8, (3, 3), padding='same', activation=activation)(x)
-        col_1_4 = self.TransNet(col_1_4, col_1_4_A)
+        # Stage 2: Decoder Pathway
+        # Path 4 -> 3
+        feat_2_4 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(feat_1_4)
+        feat_2_4 = self.TransNet(feat_2_4, feat_A_2_4)
 
-        col_2_4 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(col_1_4)
-        col_2_4 = self.TransNet(col_2_4, col_2_4_A)
-        upsample = UpSampling2D(interpolation='bilinear')(col_2_4)
-        x = self.TransNet(col_1_3, upsample)
-        col_2_3 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(x)
-        col_2_3 = self.TransNet(col_2_3, col_2_3_A)
+        up_2_4 = UpSampling2D(interpolation='bilinear')(feat_2_4)
+        x = self.TransNet(feat_1_3, up_2_4)  # Skip connection logic
 
-        upsample = UpSampling2D(interpolation='bilinear')(col_2_3)
-        x = self.TransNet(col_1_2, upsample)
-        col_2_2 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(x)
-        col_2_2 = self.TransNet(col_2_2, col_2_2_A)
+        feat_2_3 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(x)
+        feat_2_3 = self.TransNet(feat_2_3, feat_A_2_3)
 
-        upsample = UpSampling2D(interpolation='bilinear')(col_2_2)
-        x = self.TransNet(col_1_1, upsample)
-        col_2_1 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(x)
-        col_2_1 = self.TransNet(col_2_1, col_2_1_A)
+        # Path 3 -> 2
+        up_2_3 = UpSampling2D(interpolation='bilinear')(feat_2_3)
+        x = self.TransNet(feat_1_2, up_2_3)
 
-        col_3_1 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(col_2_1)
-        col_3_1 = self.TransNet(col_3_1, col_3_1_A)
+        feat_2_2 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(x)
+        feat_2_2 = self.TransNet(feat_2_2, feat_A_2_2)
 
-        col_3_2 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(col_2_2)
-        col_3_2 = self.TransNet(col_3_2, col_3_2_A)
+        # Path 2 -> 1
+        up_2_2 = UpSampling2D(interpolation='bilinear')(feat_2_2)
+        x = self.TransNet(feat_1_1, up_2_2)
 
-        col_3_3 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(col_2_3)
-        col_3_3 = self.TransNet(col_3_3, col_3_3_A)
+        feat_2_1 = Conv2D(col_2_F, (3, 3), padding='same', activation=activation)(x)
+        feat_2_1 = self.TransNet(feat_2_1, feat_A_2_1)
 
-        col_3_4 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(col_2_4)
-        col_3_4 = self.TransNet(col_3_4, col_3_4_A)
+        # Stage 3
+        feat_3_1 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(feat_2_1)
+        feat_3_1 = self.TransNet(feat_3_1, feat_A_3_1)
 
-        col_4_1 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(col_3_1)
-        col_4_2 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(col_3_2)
-        col_4_3 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(col_3_3)
-        col_4_4 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(col_3_4)
+        feat_3_2 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(feat_2_2)
+        feat_3_2 = self.TransNet(feat_3_2, feat_A_3_2)
 
-        upsample_1 = UpSampling2D(interpolation='bilinear', size=(2, 2))(col_4_1)
-        upsample_2 = UpSampling2D(interpolation='bilinear', size=(4, 4))(col_4_2)
-        upsample_3 = UpSampling2D(interpolation='bilinear', size=(8, 8))(col_4_3)
-        upsample_4 = UpSampling2D(interpolation='bilinear', size=(16, 16))(col_4_4)
+        feat_3_3 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(feat_2_3)
+        feat_3_3 = self.TransNet(feat_3_3, feat_A_3_3)
 
-        cat = self.fuse(upsample_1, upsample_2, upsample_3, upsample_4)
-        cat_A = self.fuse(upsample_1_A, upsample_2_A, upsample_3_A, upsample_4_A)
+        feat_3_4 = Conv2D(col_3_F, (3, 3), padding='same', activation=activation)(feat_2_4)
+        feat_3_4 = self.TransNet(feat_3_4, feat_A_3_4)
 
-        cat = Concatenate(axis=3)([cat, cat_A])
+        # Stage 4
+        feat_4_1 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(feat_3_1)
+        feat_4_2 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(feat_3_2)
+        feat_4_3 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(feat_3_3)
+        feat_4_4 = Conv2D(col_4_F, (3, 3), padding='same', activation=activation)(feat_3_4)
 
-        out = Conv2D(filters=last_filters, kernel_size=(3, 3), padding='same', activation="sigmoid")(cat)
+        #  Upsampling
+        up_1 = UpSampling2D(size=(2, 2), interpolation='bilinear')(feat_4_1)
+        up_2 = UpSampling2D(size=(4, 4), interpolation='bilinear')(feat_4_2)
+        up_3 = UpSampling2D(size=(8, 8), interpolation='bilinear')(feat_4_3)
+        up_4 = UpSampling2D(size=(16, 16), interpolation='bilinear')(feat_4_4)
 
-        out = Conv2D(filters=1, kernel_size=(1, 1), padding='same', activation="sigmoid")(out)
-        model = Model(inputs=[input_layer, input_layer_2], outputs=[out])
+        cat = self.fuse(up_1, up_2, up_3, up_4)
 
-        # Defining Optimizer and loss settings
-        optimizer = Adam(5e-6)
-        metrics = [self.iou_coef]
+        # ----------------  Head (Output) ----------------
+        # 融合两路特征
+        final_cat = Concatenate(axis=3)([cat, cat_A])
+
+        # 1. 倒数第二层改用 relu 激活，更稳定
+        x = Conv2D(filters=last_filters, kernel_size=(3, 3), padding='same', activation="relu")(final_cat)
+
+        # 2. 【关键修改】最后一层必须指定 dtype='float32'
+        # 确保输出概率值是 FP32 精度，防止 Loss 计算出现 NaN
+        output_layer = Conv2D(filters=1, kernel_size=(1, 1), padding='same', activation="sigmoid", dtype='float32')(x)
+
+        model = Model(inputs=[input_layer, input_layer_2], outputs=[output_layer])
+
+        # 编译模型
+        optimizer = Adam(learning_rate=5e-6)  # 注意：TF2 中参数名是 learning_rate
+        metrics = [self.iou_coef, self.dice_coef]
         model.compile(optimizer=optimizer, loss=self.iou_loss, metrics=metrics)
+
         return model

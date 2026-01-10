@@ -21,6 +21,7 @@ from tensorflow.keras.callbacks import (
 )
 from tensorflow.keras.optimizers import Adam
 
+
 # ==== 导入我们的模块 ====
 # 必须先设置环境变量
 os.environ["SM_FRAMEWORK"] = "tf.keras"

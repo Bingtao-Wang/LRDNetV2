@@ -96,14 +96,15 @@ def iou_loss(y_true, y_pred):
     return 1.0 - iou_coef(y_true, y_pred)
 
 
+
 # ------------------------------------------------------
 
 # ================= Experiment Settings =================
-model_name = 'LRDNet_Test_SM_TF2'  # 避免变量名覆盖 model 对象
+model_name = 'LRDNet_Test_TF2'  # 避免变量名覆盖 model 对象
 augmentation = False
 save_best_only = True
 seeding = False
-batch_size = 8  # GPU 上通常可以比 CPU 开大一点，如果是 4090 可以尝试 8 或 16
+batch_size = 1  # GPU 上通常可以比 CPU 开大一点，如果是 4090 可以尝试 8 或 16
 patience = 15
 epochs = 1500
 save_models = True

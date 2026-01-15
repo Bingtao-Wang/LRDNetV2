@@ -41,6 +41,7 @@ if gpus:
     except RuntimeError as e:
         print(e)
 
+
 # 开启混合精度
 # try:
 #     policy = mixed_precision.Policy('mixed_float16')

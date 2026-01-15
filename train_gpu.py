@@ -172,7 +172,7 @@ rm = ResearchModels(modelname=model_name, height=height, width=width)
 # 调整：混合精度下，epsilon 需要调整以保持稳定性，但在 Adam 默认参数通常没问题
 rm.model.compile(optimizer=Adam(learning_rate=5e-5), loss=iou_loss, metrics=[iou_coef])
 
-print(f"🚀 开始训练: Batch Size = {batch_size}, Epochs = {epochs}")
+print(f" 开始训练: Batch Size = {batch_size}, Epochs = {epochs}")
 
 history = rm.model.fit(
     train_data,
